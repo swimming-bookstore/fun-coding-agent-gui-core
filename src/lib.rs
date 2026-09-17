@@ -9,7 +9,7 @@ use fun_core::agent::{
     tool_summary,
 };
 use fun_core::grok::Grok;
-use fun_core::session::{Entry, Session};
+use fun_core::session::{prune_inspect_ids, Entry, Session};
 use fun_core::tool::get_tools;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -135,7 +135,7 @@ enum LoginEv {
 enum Kind {
     User(String),
     Agent(String),
-    Note(String),
+    Note { body: String, detail: String },
     Tool(Vec<ToolRun>),
 }
 
@@ -188,6 +188,7 @@ struct Inner {
     next_id: u64,
     stream_id: Option<u64>,
     last_tool: Option<ToolBlock>,
+    pending_prune: Option<Vec<String>>,
     queue_flash: Option<(usize, Instant)>,
     login: Option<LoginInfo>,
     toast: String,
@@ -323,6 +324,7 @@ fn run(tx: Sender<Msg>, rx: Receiver<Msg>) {
         next_id: 1,
         stream_id: None,
         last_tool: None,
+        pending_prune: None,
         queue_flash: None,
         login: None,
         toast: String::new(),
@@ -335,7 +337,10 @@ fn run(tx: Sender<Msg>, rx: Receiver<Msg>) {
     } else {
         append_item(
             &mut inner,
-            Kind::Note("Open a folder to start a chat.".into()),
+            Kind::Note {
+                body: "Open a folder to start a chat.".into(),
+                detail: String::new(),
+            },
             false,
         );
     }
@@ -696,7 +701,10 @@ fn remove_folder(inner: &mut Inner, workspace: &Path) {
             clear_thread(inner);
             append_item(
                 inner,
-                Kind::Note("Open a folder to start a chat.".into()),
+                Kind::Note {
+                    body: "Open a folder to start a chat.".into(),
+                    detail: String::new(),
+                },
                 false,
             );
         }
@@ -771,6 +779,7 @@ fn unread_split(history: &[Kind], unread: u32) -> usize {
 fn clear_thread(inner: &mut Inner) {
     inner.stream_id = None;
     inner.last_tool = None;
+    inner.pending_prune = None;
     inner.items.clear();
 }
 
@@ -789,7 +798,8 @@ fn append_marker(inner: &mut Inner) {
 
 fn append_item(inner: &mut Inner, kind: Kind, streaming: bool) -> Option<u64> {
     let empty = match &kind {
-        Kind::User(s) | Kind::Agent(s) | Kind::Note(s) => s.trim().is_empty(),
+        Kind::User(s) | Kind::Agent(s) => s.trim().is_empty(),
+        Kind::Note { body, .. } => body.trim().is_empty(),
         Kind::Tool(runs) => runs.is_empty(),
     };
     if empty {
@@ -815,13 +825,13 @@ fn append_item(inner: &mut Inner, kind: Kind, streaming: bool) -> Option<u64> {
             tool_summary: String::new(),
             tool_detail: String::new(),
         },
-        Kind::Note(body) => ChatItem {
+        Kind::Note { body, detail } => ChatItem {
             id,
             kind: ChatKind::Note,
             body,
             streaming: false,
             tool_summary: String::new(),
-            tool_detail: String::new(),
+            tool_detail: detail,
         },
         Kind::Tool(runs) => {
             let (ok, fail) = tool_counts(&runs);
@@ -1407,13 +1417,24 @@ fn apply_log(inner: &mut Inner, line: LogLine) {
             }
         }
         LogLine::Dim(t) => {
-            append_item(inner, Kind::Note(t), false);
+            let detail = if t.contains("dropped ") && t.contains("from context") {
+                inner
+                    .pending_prune
+                    .take()
+                    .map(|lines| lines.join("\n"))
+                    .unwrap_or_default()
+            } else {
+                String::new()
+            };
+            append_item(inner, Kind::Note { body: t, detail }, false);
         }
         LogLine::Tools { runs } => {
             merge_tools(inner, runs);
         }
         LogLine::Usage(_) => {}
-        LogLine::Pruned { .. } => {}
+        LogLine::Pruned { lines, .. } => {
+            inner.pending_prune = Some(lines);
+        }
     }
 }
 
@@ -1421,6 +1442,7 @@ fn replay(session: &Session) -> Vec<Kind> {
     let mut out = Vec::new();
     let mut i = 0;
     let entries = &session.entries;
+    let mut notes = session.prune_notes.iter().peekable();
     while i < entries.len() {
         match &entries[i] {
             Entry::User { text } => {
@@ -1496,6 +1518,15 @@ fn replay(session: &Session) -> Vec<Kind> {
                 }
             }
             Entry::Tool(_) => i += 1,
+        }
+        while notes.peek().is_some_and(|(at, _)| *at == i) {
+            let (_, ids) = notes.next().expect("peeked");
+            let n = ids.len();
+            let detail = prune_inspect_ids(&session.entries, ids.iter().copied()).join("\n");
+            out.push(Kind::Note {
+                body: format!("(dropped {n} messages from context)"),
+                detail,
+            });
         }
     }
     out
