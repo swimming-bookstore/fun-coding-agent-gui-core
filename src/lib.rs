@@ -1413,6 +1413,7 @@ fn apply_log(inner: &mut Inner, line: LogLine) {
             merge_tools(inner, runs);
         }
         LogLine::Usage(_) => {}
+        LogLine::Pruned { .. } => {}
     }
 }
 
